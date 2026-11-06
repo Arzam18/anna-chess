@@ -1,0 +1,237 @@
+name: Android ARM64 (NEON + Dotprod)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anna-android-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_API: 24
+  ANDROID_NDK_VERSION: r27c
+
+jobs:
+  host-tests:
+    name: Host reference tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Fetch the upstream default NNUE network
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p nets
+          curl -fL --retry 3 --retry-delay 2 \
+            https://raw.githubusercontent.com/Lironktf/anna-chess/main/nets/default.bin \
+            -o nets/default.bin
+          test -s nets/default.bin
+          sha256sum nets/default.bin | tee anna-network.sha256
+      - name: Run engine tests
+        run: cargo test --release -p engine
+      - name: Verify host build, network, UCI, bench and perft
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p engine
+          ./target/release/engine netcheck nets/default.bin --strict | tee host-netcheck.txt
+          {
+            printf 'uci\nisready\nposition startpos\ngo depth 4\n'
+            sleep 3
+            printf 'quit\n'
+          } | timeout 20s ./target/release/engine | tee host-uci-smoke.txt
+          grep -q 'uciok' host-uci-smoke.txt
+          grep -q 'readyok' host-uci-smoke.txt
+          grep -q 'bestmove' host-uci-smoke.txt
+          ./target/release/engine bench 4 1 | tee host-bench.txt
+          ./target/release/engine perft 5 | tee host-perft.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anna-host-reference-tests
+          path: |
+            host-bench.txt
+            host-perft.txt
+            host-netcheck.txt
+            host-uci-smoke.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anna-network
+          path: |
+            nets/default.bin
+            anna-network.sha256
+
+  android:
+    name: Android ARM64 ${{ matrix.variant }}
+    needs: host-tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: neon
+            rustflags: "-C target-cpu=generic -C target-feature=+neon,-dotprod"
+            fathom_march: "-march=armv8-a -mtune=cortex-a76"
+          - variant: dotprod
+            rustflags: "-C target-cpu=generic -C target-feature=+neon,+dotprod"
+            fathom_march: "-march=armv8.2-a+dotprod -mtune=cortex-a76"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and Android target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      - name: Install Android NDK r27c without sdkmanager
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
+            -o "$RUNNER_TEMP/android-ndk-r27c.zip"
+          unzip -q "$RUNNER_TEMP/android-ndk-r27c.zip" -d "$RUNNER_TEMP"
+          NDK="$RUNNER_TEMP/android-ndk-r27c"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "NDK=$NDK"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: anna-network
+          path: network-artifact
+
+      - name: Restore the exactly validated NNUE network
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p nets
+          cp network-artifact/nets/default.bin nets/default.bin
+          cp network-artifact/anna-network.sha256 anna-network.sha256
+          test -s nets/default.bin
+          sha256sum --check anna-network.sha256
+          stat -c 'Network bytes: %s' nets/default.bin
+
+      - name: Build Android ARM64 ${{ matrix.variant }}
+        shell: bash
+        env:
+          CC: aarch64-linux-android24-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android24-clang
+          FATHOM_MARCH: ${{ matrix.fathom_march }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_DIR: target/android-${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          cargo test --no-run --release -p engine --lib --target aarch64-linux-android --message-format=json-render-diagnostics > android-test-build.jsonl
+          cargo build --release -p engine --target aarch64-linux-android
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/engine" "dist/anna-android-arm64-${{ matrix.variant }}"
+          TEST_BIN="$(python3 - <<'PYJSON'
+          import json
+          from pathlib import Path
+          found = []
+          for line in Path("android-test-build.jsonl").read_text().splitlines():
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              target = event.get("target", {})
+              profile = event.get("profile", {})
+              if (event.get("reason") == "compiler-artifact" and target.get("name") == "engine"
+            and "lib" in target.get("kind", []) and profile.get("test")
+            and event.get("executable")):
+                  found.append(event["executable"])
+          if not found:
+              raise SystemExit("Could not identify the cross-compiled engine library test harness")
+          print(found[-1])
+          PYJSON
+          )"
+          test -x "$TEST_BIN"
+          cp "$TEST_BIN" "dist/anna-android-arm64-${{ matrix.variant }}-simd-tests"
+          cp nets/default.bin dist/anna-v5f-default.bin
+          (cd dist && sha256sum anna-v5f-default.bin > anna-v5f-default.bin.sha256)
+          file "dist/anna-android-arm64-${{ matrix.variant }}"
+          readelf -h "dist/anna-android-arm64-${{ matrix.variant }}" | tee dist/elf-header.txt
+          if ! grep -Eq 'Machine:[[:space:]]+AArch64' dist/elf-header.txt; then
+            echo "ERROR: target binary is not AArch64 ELF" >&2
+            exit 1
+          fi
+          sha256sum "dist/anna-android-arm64-${{ matrix.variant }}" | tee "dist/anna-android-arm64-${{ matrix.variant }}.sha256"
+
+      - name: Verify generated ARM instructions
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          BIN="dist/anna-android-arm64-${VARIANT}"
+          OBJDUMP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          "$OBJDUMP" -d "$BIN" > dist/anna-disassembly.txt
+          if ! grep -Eiq '\b(add|sub|mul|mla|mls|smax|smin|umax|umin|shl|ushr|sshr|sxtl|uxtl|sadalp|uadalp|fadd|fsub|fmul|fmla|fmax|fmin|sqxtn|xtn|addv|saddlv|smull|umull|smlal|umlal|ld1|st1)[[:space:]].*v[0-9]+\.' dist/anna-disassembly.txt; then
+            echo "ERROR: no AArch64 NEON vector instructions detected" >&2
+            exit 1
+          fi
+          if [[ "$VARIANT" == "dotprod" ]]; then
+            if ! grep -Eiq '[[:space:]]sdot[[:space:]]' dist/anna-disassembly.txt; then
+              echo "ERROR: Dotprod build contains no SDOT instruction" >&2
+              exit 1
+            fi
+          else
+            if grep -Eiq '[[:space:]]sdot[[:space:]]' dist/anna-disassembly.txt; then
+              echo "ERROR: NEON baseline unexpectedly contains SDOT" >&2
+              exit 1
+            fi
+          fi
+          {
+            echo "Variant: $VARIANT"
+            echo "Rust flags: ${{ matrix.rustflags }}"
+            echo "Fathom flags: ${{ matrix.fathom_march }}"
+            echo "NEON vector instruction check: PASS"
+            if [[ "$VARIANT" == "dotprod" ]]; then echo "SDOT instruction check: PASS"; else echo "SDOT absent from baseline: PASS"; fi
+          } | tee dist/ARM-SIMD-VERIFICATION.txt
+
+      - name: Prepare on-device test instructions
+        shell: bash
+        run: |
+          cat > dist/PHONE-TEST-INSTRUCTIONS.txt <<EOF
+          Anna Android ARM64 ${{ matrix.variant }}
+
+          These are Android/Bionic ARM64 executables. GitHub's x86_64 runner cannot execute them;
+          they are cross-compiled and statically inspected in this workflow.
+
+          In Termux, from the directory containing the downloaded artifact files:
+            chmod +x anna-android-arm64-${{ matrix.variant }} anna-android-arm64-${{ matrix.variant }}-simd-tests
+            ./anna-android-arm64-${{ matrix.variant }}-simd-tests --nocapture
+            sha256sum --check anna-v5f-default.bin.sha256
+            ./anna-android-arm64-${{ matrix.variant }} netcheck anna-v5f-default.bin --strict
+            ./anna-android-arm64-${{ matrix.variant }} bench 5 1
+            ./anna-android-arm64-${{ matrix.variant }} perft 5
+
+          UCI smoke test:
+            (printf 'uci\nisready\nposition startpos\ngo depth 8\n'; sleep 10; printf 'quit\n') | ./anna-android-arm64-${{ matrix.variant }}
+
+          Check that the SIMD test process exits successfully and that UCI returns a bestmove.
+          Compare the NEON and Dotprod bench output on the same phone and thermal state.
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anna-android-arm64-${{ matrix.variant }}
+          path: |
+            dist/anna-android-arm64-${{ matrix.variant }}
+            dist/anna-android-arm64-${{ matrix.variant }}-simd-tests
+            dist/PHONE-TEST-INSTRUCTIONS.txt
+            dist/*.sha256
+            dist/elf-header.txt
+            dist/ARM-SIMD-VERIFICATION.txt
+            dist/anna-disassembly.txt
