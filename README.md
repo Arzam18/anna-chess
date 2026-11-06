@@ -81,6 +81,16 @@ cargo test --release -p engine       # perft suite, NNUE equivalence tests, sear
 
 `.cargo/config.toml` sets `target-cpu=native`; the CI workflow builds the portable `x86-64-v3` binaries.
 
+## Android ARM64 (community port)
+
+The repository now includes a manually dispatched Android NDK workflow at `.github/workflows/android.yml`.
+It produces two separate `aarch64-linux-android` builds:
+
+- `NEON`: ARMv8-A baseline, with Dotprod explicitly disabled.
+- `Dotprod`: ARMv8.2-A with the Dot Product extension enabled.
+
+The workflow fetches the upstream `nets/default.bin` once, validates it with `netcheck --strict` on a host reference build, and passes those exact same network bytes and checksum to both Android variants. It also runs host UCI, bench and perft checks. It cross-compiles each Android variant and its Rust unit-test harness, then inspects the final ELF/disassembly for NEON and SDOT. Android binaries are not executed on GitHub's x86-64 runner; each artifact includes its test harness and phone instructions for Termux, where the scalar-differential tests can run on real ARM64 hardware. CI checks establish build and static SIMD presence only; Android-device runtime and playing-strength testing are still required. See `ANDROID-ARM64-PORT-AUDIT.md` for details.
+
 ## UCI options
 
 | Option | Default | Notes |
