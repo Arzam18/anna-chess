@@ -32,8 +32,12 @@ fn main() {
     let march = std::env::var("FATHOM_MARCH").unwrap_or_else(|_| "-march=native".to_string());
     println!("cargo:rerun-if-env-changed=FATHOM_MARCH");
     let obj = out.join("tbprobe.o");
-    let status = Command::new(&cc)
-        .args(["-O3", &march, "-std=gnu11", "-fPIC", "-w", "-c"])
+    let mut compiler = Command::new(&cc);
+    compiler.arg("-O3");
+    // FATHOM_MARCH may contain more than one compiler option (for example, -march and -mtune).
+    compiler.args(march.split_whitespace());
+    let status = compiler
+        .args(["-std=gnu11", "-fPIC", "-w", "-c"])
         .arg(format!("-I{}", src_dir.display()))
         .arg(src_dir.join("tbprobe.c"))
         .arg("-o")
