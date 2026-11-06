@@ -146,6 +146,15 @@ impl TranspositionTable {
                 std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let i = self.index(key);
+            // SAFETY: prefetch is a hint; the pointer is in bounds.
+            unsafe {
+                let p = (*self.clusters.get()).as_ptr().add(i);
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) p, options(nostack, preserves_flags));
+            }
+        }
     }
 
     /// Probe: returns (hit, data, writer).

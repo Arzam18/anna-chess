@@ -148,7 +148,27 @@ fn dot_clamped(acc: &[i16; H], row: &[i8; H]) -> i32 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_clamped(acc: &[i16; H], row: &[i8; H]) -> i32 {
+    use std::arch::aarch64::*;
+    // NEON handles the full 0..256 activation range without narrowing it to signed bytes.
+    // Each 8-element block is widened to two groups of four i32 products before accumulation.
+    unsafe {
+        let zero = vdupq_n_s16(0);
+        let cap = vdupq_n_s16(256);
+        let mut sum = vdupq_n_s32(0);
+        for i in (0..H).step_by(8) {
+            let a = vminq_s16(vmaxq_s16(vld1q_s16(acc.as_ptr().add(i)), zero), cap);
+            let r = vmovl_s8(vld1_s8(row.as_ptr().add(i)));
+            sum = vaddq_s32(sum, vmull_s16(vget_low_s16(a), vget_low_s16(r)));
+            sum = vaddq_s32(sum, vmull_s16(vget_high_s16(a), vget_high_s16(r)));
+        }
+        vaddvq_s32(sum)
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline]
 fn dot_clamped(acc: &[i16; H], row: &[i8; H]) -> i32 {
     let mut dot: i32 = 0;

@@ -148,8 +148,18 @@ fn main() {
                 let mut seed = 99u64;
                 for _ in 0..positions.len() {
                     for k in 0..14 { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; idxs[k] = (seed % engine::nnue::v3::PP_FEATURES as u64) as usize; }
+                    #[cfg(target_arch = "x86_64")]
                     if pf {
                         for &f in &idxs { let p = net.pp_w[f].0.as_ptr() as *const i8; for l in 0..16 { unsafe { std::arch::x86_64::_mm_prefetch(p.add(l * 64), std::arch::x86_64::_MM_HINT_T0); } } }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    if pf {
+                        for &f in &idxs {
+                            let p = net.pp_w[f].0.as_ptr();
+                            for l in 0..16 {
+                                unsafe { std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) p.add(l * 64), options(nostack, preserves_flags)); }
+                            }
+                        }
                     }
                     for &f in &idxs { engine::nnue::v3::kernels::add_i8_row(&mut v.0, &net.pp_w[f].0); }
                 }

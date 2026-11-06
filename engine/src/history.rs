@@ -190,6 +190,22 @@ impl History {
                 _mm_prefetch(self.non_pawn_corr.as_ptr().add(History::non_pawn_idx(stm, Color::Black, npb)) as *const i8, _MM_HINT_T0);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // PRFM is only a cache hint; each indexed pointer is within its corresponding table.
+            let sf = crate::params::SF_CORR.get() != 0;
+            if sf {
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.sf_pawn_corr.as_ptr().add(History::corr_idx(stm, pawn_key)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.sf_minor_corr.as_ptr().add(History::corr_idx(stm, minor_key)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.sf_non_pawn_corr.as_ptr().add(History::non_pawn_idx(stm, Color::White, npw)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.sf_non_pawn_corr.as_ptr().add(History::non_pawn_idx(stm, Color::Black, npb)), options(nostack, preserves_flags));
+            } else {
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.pawn_corr.as_ptr().add(History::corr_idx(stm, pawn_key)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.minor_corr.as_ptr().add(History::corr_idx(stm, minor_key)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.non_pawn_corr.as_ptr().add(History::non_pawn_idx(stm, Color::White, npw)), options(nostack, preserves_flags));
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) self.non_pawn_corr.as_ptr().add(History::non_pawn_idx(stm, Color::Black, npb)), options(nostack, preserves_flags));
+            }
+        }
     }
 
     #[inline(always)]
