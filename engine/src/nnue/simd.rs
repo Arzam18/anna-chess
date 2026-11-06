@@ -211,9 +211,126 @@ pub mod avx2 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// AArch64 NEON
+// ---------------------------------------------------------------------------------------------
+#[cfg(target_arch = "aarch64")]
+pub mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    const CHUNK: usize = 8; // i16 lanes per 128-bit NEON register
+    const _: () = assert!(L1 % CHUNK == 0);
+
+    // The wrapping i16 operations intentionally match the scalar and AVX2 kernels.
+    #[inline]
+    pub fn add_feature(acc: &mut [i16; L1], w: &[i16; L1]) {
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let a = vld1q_s16(acc.as_ptr().add(off));
+                let b = vld1q_s16(w.as_ptr().add(off));
+                vst1q_s16(acc.as_mut_ptr().add(off), vaddq_s16(a, b));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn apply_rows(acc: &mut [i16; L1], rows: &[Align64<[i16; L1]>], adds: &[usize], subs: &[usize]) {
+        for &r in adds.iter().chain(subs) { assert!(r < rows.len()); }
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let mut v = vld1q_s16(acc.as_ptr().add(off));
+                for &r in adds { v = vaddq_s16(v, vld1q_s16(rows.get_unchecked(r).0.as_ptr().add(off))); }
+                for &r in subs { v = vsubq_s16(v, vld1q_s16(rows.get_unchecked(r).0.as_ptr().add(off))); }
+                vst1q_s16(acc.as_mut_ptr().add(off), v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn sub_feature(acc: &mut [i16; L1], w: &[i16; L1]) {
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let a = vld1q_s16(acc.as_ptr().add(off));
+                let b = vld1q_s16(w.as_ptr().add(off));
+                vst1q_s16(acc.as_mut_ptr().add(off), vsubq_s16(a, b));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn add_sub(out: &mut [i16; L1], prev: &[i16; L1], a: &[i16; L1], s: &[i16; L1]) {
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let v = vsubq_s16(vaddq_s16(vld1q_s16(prev.as_ptr().add(off)), vld1q_s16(a.as_ptr().add(off))), vld1q_s16(s.as_ptr().add(off)));
+                vst1q_s16(out.as_mut_ptr().add(off), v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn add_sub_sub(out: &mut [i16; L1], prev: &[i16; L1], a: &[i16; L1], s1: &[i16; L1], s2: &[i16; L1]) {
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let mut v = vaddq_s16(vld1q_s16(prev.as_ptr().add(off)), vld1q_s16(a.as_ptr().add(off)));
+                v = vsubq_s16(v, vld1q_s16(s1.as_ptr().add(off)));
+                v = vsubq_s16(v, vld1q_s16(s2.as_ptr().add(off)));
+                vst1q_s16(out.as_mut_ptr().add(off), v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn add_add_sub_sub(out: &mut [i16; L1], prev: &[i16; L1], a1: &[i16; L1], a2: &[i16; L1], s1: &[i16; L1], s2: &[i16; L1]) {
+        unsafe {
+            for i in 0..L1 / CHUNK {
+                let off = i * CHUNK;
+                let mut v = vaddq_s16(vld1q_s16(prev.as_ptr().add(off)), vld1q_s16(a1.as_ptr().add(off)));
+                v = vaddq_s16(v, vld1q_s16(a2.as_ptr().add(off)));
+                v = vsubq_s16(v, vld1q_s16(s1.as_ptr().add(off)));
+                v = vsubq_s16(v, vld1q_s16(s2.as_ptr().add(off)));
+                vst1q_s16(out.as_mut_ptr().add(off), v);
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn dot_half(acc: *const i16, weights: *const i16, mut sum: int32x4_t) -> int32x4_t {
+        let zero = vdupq_n_s16(0);
+        let cap = vdupq_n_s16(QA as i16);
+        for i in 0..L1 / CHUNK {
+            let off = i * CHUNK;
+            let v = vminq_s16(vmaxq_s16(vld1q_s16(acc.add(off)), zero), cap);
+            let w = vld1q_s16(weights.add(off));
+            // QA * max(|weight|) fits in signed i16 for this network's quantisation.
+            let vw = vmulq_s16(v, w);
+            sum = vmlal_s16(sum, vget_low_s16(vw), vget_low_s16(v));
+            sum = vmlal_s16(sum, vget_high_s16(vw), vget_high_s16(v));
+        }
+        sum
+    }
+
+    #[inline]
+    pub fn output(us: &[i16; L1], them: &[i16; L1], w: &[i16; 2 * L1]) -> i32 {
+        unsafe {
+            let zero = vdupq_n_s32(0);
+            let sum = dot_half(us.as_ptr(), w.as_ptr(), zero);
+            let sum = dot_half(them.as_ptr(), w.as_ptr().add(L1), sum);
+            vaddvq_s32(sum)
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use neon::*;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub use avx2::*;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 pub use scalar::*;
 
 #[cfg(test)]
@@ -240,6 +357,19 @@ mod tests {
         let mut seed = 1u64;
         for _ in 0..200 {
             let prev = arr(&mut seed, 400);
+            // Exercise the batched row-update kernel directly, including multiple adds/subtracts.
+            let mut rows = vec![super::super::Align64([0i16; L1]); 5];
+            for row in rows.iter_mut() {
+                for value in row.0.iter_mut() {
+                    *value = (rnd(&mut seed) % 401) as i16 - 200;
+                }
+            }
+            let mut batched = prev.0;
+            let mut reference = prev.0;
+            apply_rows(&mut batched, &rows, &[0, 2, 4], &[1, 3]);
+            scalar::apply_rows(&mut reference, &rows, &[0, 2, 4], &[1, 3]);
+            assert_eq!(batched[..], reference[..]);
+
             let a1 = arr(&mut seed, 200);
             let a2 = arr(&mut seed, 200);
             let s1 = arr(&mut seed, 200);

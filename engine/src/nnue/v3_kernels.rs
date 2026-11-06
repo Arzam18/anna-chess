@@ -300,9 +300,215 @@ pub mod avx2 {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// AArch64 NEON / Dot Product
+// -------------------------------------------------------------------------------------------------
+#[cfg(target_arch = "aarch64")]
+pub mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    const CHUNK: usize = 8;
+    const _: () = assert!(N % CHUNK == 0);
+    const _: () = assert!(HALF % CHUNK == 0);
+
+    #[inline]
+    pub fn apply_rows(
+        base: &[i16; N], out: &mut [i16; N],
+        psq: &[super::super::super::super::Align64<[i16; N]>], add16: &[usize], sub16: &[usize],
+        pp: &[super::super::super::super::Align64<[i8; N]>], add8: &[u32], sub8: &[u32],
+    ) {
+        for &r in add16.iter().chain(sub16) { assert!(r < psq.len()); }
+        for &r in add8.iter().chain(sub8) { assert!((r as usize) < pp.len()); }
+        unsafe {
+            for i in 0..N / CHUNK {
+                let off = i * CHUNK;
+                let mut v = vld1q_s16(base.as_ptr().add(off));
+                for &r in add16 { v = vaddq_s16(v, vld1q_s16(psq.get_unchecked(r).0.as_ptr().add(off))); }
+                for &r in sub16 { v = vsubq_s16(v, vld1q_s16(psq.get_unchecked(r).0.as_ptr().add(off))); }
+                for &r in add8 { v = vaddq_s16(v, vmovl_s8(vld1_s8(pp.get_unchecked(r as usize).0.as_ptr().add(off)))); }
+                for &r in sub8 { v = vsubq_s16(v, vmovl_s8(vld1_s8(pp.get_unchecked(r as usize).0.as_ptr().add(off)))); }
+                vst1q_s16(out.as_mut_ptr().add(off), v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn add_i16_row(acc: &mut [i16; N], w: &[i16; N]) {
+        unsafe {
+            for i in 0..N / CHUNK {
+                let off = i * CHUNK;
+                vst1q_s16(acc.as_mut_ptr().add(off), vaddq_s16(vld1q_s16(acc.as_ptr().add(off)), vld1q_s16(w.as_ptr().add(off))));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn sub_i16_row(acc: &mut [i16; N], w: &[i16; N]) {
+        unsafe {
+            for i in 0..N / CHUNK {
+                let off = i * CHUNK;
+                vst1q_s16(acc.as_mut_ptr().add(off), vsubq_s16(vld1q_s16(acc.as_ptr().add(off)), vld1q_s16(w.as_ptr().add(off))));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn add_i8_row(acc: &mut [i16; N], w: &[i8; N]) {
+        unsafe {
+            for i in 0..N / CHUNK {
+                let off = i * CHUNK;
+                let row = vmovl_s8(vld1_s8(w.as_ptr().add(off)));
+                vst1q_s16(acc.as_mut_ptr().add(off), vaddq_s16(vld1q_s16(acc.as_ptr().add(off)), row));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn sub_i8_row(acc: &mut [i16; N], w: &[i8; N]) {
+        unsafe {
+            for i in 0..N / CHUNK {
+                let off = i * CHUNK;
+                let row = vmovl_s8(vld1_s8(w.as_ptr().add(off)));
+                vst1q_s16(acc.as_mut_ptr().add(off), vsubq_s16(vld1q_s16(acc.as_ptr().add(off)), row));
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn pack_pair(a: int16x8_t, b: int16x8_t, out: *mut u8) {
+        let zero = vdupq_n_s16(0);
+        let cap = vdupq_n_s16(QA as i16);
+        let a = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(a, zero), cap));
+        let b = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(b, zero), cap));
+        let lo = vshrn_n_u32::<9>(vmull_u16(vget_low_u16(a), vget_low_u16(b)));
+        let hi = vshrn_n_u32::<9>(vmull_u16(vget_high_u16(a), vget_high_u16(b)));
+        vst1_u8(out, vmovn_u16(vcombine_u16(lo, hi)));
+    }
+
+    #[inline]
+    pub fn pairwise(acc: &[i16; N], out: &mut [u8; N], off: usize) {
+        unsafe {
+            for i in 0..HALF / CHUNK {
+                let pos = i * CHUNK;
+                let a = vld1q_s16(acc.as_ptr().add(pos));
+                let b = vld1q_s16(acc.as_ptr().add(HALF + pos));
+                pack_pair(a, b, out.as_mut_ptr().add(off + pos));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn pairwise2(x: &[i16; N], y: &[i16; N], out: &mut [u8; N], off: usize) {
+        unsafe {
+            for i in 0..HALF / CHUNK {
+                let pos = i * CHUNK;
+                let a = vaddq_s16(vld1q_s16(x.as_ptr().add(pos)), vld1q_s16(y.as_ptr().add(pos)));
+                let b = vaddq_s16(vld1q_s16(x.as_ptr().add(HALF + pos)), vld1q_s16(y.as_ptr().add(HALF + pos)));
+                pack_pair(a, b, out.as_mut_ptr().add(off + pos));
+            }
+        }
+    }
+
+    // Portable AArch64 NEON implementation: unsigned bytes are widened before signed products.
+    #[cfg(not(target_feature = "dotprod"))]
+    #[inline]
+    pub fn l1_dots(x: &[u8; N], w_rows: &[[i8; N]], out: &mut [i32; L2]) {
+        unsafe {
+            for (o, w) in w_rows.iter().enumerate().take(L2) {
+                let mut lo = vdupq_n_s32(0);
+                let mut hi = vdupq_n_s32(0);
+                for i in (0..N).step_by(8) {
+                    let xv = vmovl_u8(vld1_u8(x.as_ptr().add(i)));
+                    let wv = vmovl_s8(vld1_s8(w.as_ptr().add(i)));
+                    let xv = vreinterpretq_s16_u16(xv); // values are 0..255, so still non-negative
+                    lo = vaddq_s32(lo, vmull_s16(vget_low_s16(xv), vget_low_s16(wv)));
+                    hi = vaddq_s32(hi, vmull_s16(vget_high_s16(xv), vget_high_s16(wv)));
+                }
+                out[o] = vaddvq_s32(lo) + vaddvq_s32(hi);
+            }
+        }
+    }
+
+    // Dotprod path. SDOT consumes signed bytes; split each unsigned input into its low 7 bits
+    // plus a 128 correction for lanes whose high bit is set. This keeps the full u8 API exact.
+    // Inline assembly keeps this path usable on stable Rust versions where vdotq_s32 is not yet
+    // exposed as a stable std::arch intrinsic.
+    #[cfg(target_feature = "dotprod")]
+    #[inline(always)]
+    unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut result = acc;
+        std::arch::asm!(
+            "sdot {result:v}.4s, {a:v}.16b, {b:v}.16b",
+            result = inout(vreg) result,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        result
+    }
+
+    #[cfg(target_feature = "dotprod")]
+    #[inline]
+    pub fn l1_dots(x: &[u8; N], w_rows: &[[i8; N]], out: &mut [i32; L2]) {
+        unsafe {
+            let low_mask = vdupq_n_u8(0x7f);
+            let high_bit = vdupq_n_u8(0x80);
+            for (o, w) in w_rows.iter().enumerate().take(L2) {
+                let mut acc = vdupq_n_s32(0);
+                let mut correction = 0i32;
+                for i in (0..N).step_by(16) {
+                    let xv = vld1q_u8(x.as_ptr().add(i));
+                    let wv = vld1q_s8(w.as_ptr().add(i));
+                    let hi_mask = vceqq_u8(vandq_u8(xv, high_bit), high_bit);
+                    let xlo = vreinterpretq_s8_u8(vandq_u8(xv, low_mask));
+                    acc = sdot(acc, xlo, wv);
+                    let whi = vandq_s8(wv, vreinterpretq_s8_u8(hi_mask));
+                    let pairs16 = vpaddlq_s8(whi);
+                    let pairs32 = vpaddlq_s16(pairs16);
+                    correction += vaddvq_s32(pairs32);
+                }
+                out[o] = vaddvq_s32(acc) + correction * 128;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn l2_forward_t(h1: &[f32; L2_DUAL], wt: &[[f32; L3]], b: &[f32], h2: &mut [f32; L3]) {
+        unsafe {
+            let zero = vdupq_n_f32(0.0);
+            let one = vdupq_n_f32(1.0);
+            for o in (0..L3).step_by(4) {
+                let mut acc = vmulq_n_f32(vld1q_f32(wt[0].as_ptr().add(o)), h1[0]);
+                for i in 1..L2_DUAL {
+                    acc = vfmaq_n_f32(acc, vld1q_f32(wt[i].as_ptr().add(o)), h1[i]);
+                }
+                let v = vaddq_f32(acc, vld1q_f32(b.as_ptr().add(o)));
+                vst1q_f32(h2.as_mut_ptr().add(o), vminq_f32(vmaxq_f32(v, zero), one));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn l2_forward(h1: &[f32; L2_DUAL], w: &[[f32; L2_DUAL]], b: &[f32], h2: &mut [f32; L3]) {
+        unsafe {
+            for o in 0..L3 {
+                let mut acc = vdupq_n_f32(0.0);
+                for i in (0..L2_DUAL).step_by(4) {
+                    acc = vfmaq_f32(acc, vld1q_f32(w[o].as_ptr().add(i)), vld1q_f32(h1.as_ptr().add(i)));
+                }
+                let v = vaddvq_f32(acc) + b[o];
+                h2[o] = v.clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use neon::*;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub use avx2::*;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 pub use scalar::*;
 
 #[cfg(test)]
@@ -318,6 +524,33 @@ mod tests {
     fn v3_kernels_match_scalar() {
         let mut s = 5u64;
         for _ in 0..100 {
+            // Exercise the fused piece-square + pawn-pair row update against its scalar reference.
+            let psq = {
+                let mut rows = vec![crate::nnue::Align64([0i16; N]); 4];
+                for row in rows.iter_mut() {
+                    for value in row.0.iter_mut() {
+                        *value = (rnd(&mut s) % 401) as i16 - 200;
+                    }
+                }
+                rows
+            };
+            let pp = {
+                let mut rows = vec![crate::nnue::Align64([0i8; N]); 4];
+                for row in rows.iter_mut() {
+                    for value in row.0.iter_mut() {
+                        *value = (rnd(&mut s) % 255) as i8;
+                    }
+                }
+                rows
+            };
+            let mut base = [0i16; N];
+            for value in base.iter_mut() { *value = (rnd(&mut s) % 1201) as i16 - 600; }
+            let mut fused = [0i16; N];
+            let mut reference = [0i16; N];
+            apply_rows(&base, &mut fused, &psq, &[0, 2], &[1], &pp, &[1, 3], &[0]);
+            scalar::apply_rows(&base, &mut reference, &psq, &[0, 2], &[1], &pp, &[1, 3], &[0]);
+            assert_eq!(fused[..], reference[..]);
+
             let mut acc = [0i16; N];
             for v in acc.iter_mut() {
                 *v = (rnd(&mut s) % 1201) as i16 - 400;
@@ -352,6 +585,16 @@ mod tests {
             l1_dots(&o1, &rows, &mut d1);
             scalar::l1_dots(&o1, &rows, &mut d2);
             assert_eq!(d1, d2);
+            // Exercise all u8 values, including the high-bit correction used by the AArch64 SDOT path.
+            // The upstream AVX2 kernel relies on the production pairwise activation invariant (0..127).
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut x_full = [0u8; N];
+                for v in x_full.iter_mut() { *v = rnd(&mut s) as u8; }
+                l1_dots(&x_full, &rows, &mut d1);
+                scalar::l1_dots(&x_full, &rows, &mut d2);
+                assert_eq!(d1, d2);
+            }
             let mut h1 = [0f32; L2_DUAL];
             for v in h1.iter_mut() {
                 *v = (rnd(&mut s) % 1000) as f32 / 1000.0;

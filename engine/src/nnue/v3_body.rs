@@ -562,6 +562,18 @@ fn prefetch_row<T>(row: &T) {
             n += 1;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let p = row as *const T as *const u8;
+        let bytes = std::mem::size_of::<T>();
+        let mut off = 0;
+        let mut n = 0;
+        while off < bytes && n < PREFETCH_LINES {
+            std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) p.add(off), options(nostack, preserves_flags));
+            off += 64;
+            n += 1;
+        }
+    }
 }
 
 impl StateV3 {
